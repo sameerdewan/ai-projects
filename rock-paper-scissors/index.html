@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Rock Paper Scissors AI</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/handpose"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/knn-classifier"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      #historyTableWrapper {
+        max-height: 400px;
+        overflow-y: auto;
+      }
+    </style>
+  </head>
+  <body class="bg-gray-100 font-sans">
+    <div class="flex flex-col md:flex-row gap-4 p-4">
+      <div class="flex flex-col items-center relative">
+        <video
+          id="webcam"
+          autoplay
+          playsinline
+          width="640"
+          height="480"
+          class="rounded-xl border shadow"
+        ></video>
+        <canvas
+          id="overlay"
+          width="640"
+          height="480"
+          class="absolute top-0 left-0 rounded-xl"
+        ></canvas>
+        <div
+          class="absolute top-2 left-2 bg-white bg-opacity-80 px-4 py-2 rounded shadow text-lg font-bold"
+          id="gestureDisplay"
+        ></div>
+        <div class="mt-4 flex gap-2">
+          <button
+            id="toggleTraining"
+            class="px-4 py-2 bg-blue-600 text-white rounded"
+          >
+            Toggle Training
+          </button>
+          <select id="labelSelector" class="px-2 py-1 border rounded">
+            <option value="R">Rock</option>
+            <option value="P">Paper</option>
+            <option value="S">Scissors</option>
+          </select>
+          <button
+            id="trigger"
+            class="px-4 py-2 bg-green-600 text-white rounded hidden"
+          >
+            Play Round
+          </button>
+        </div>
+        <div id="status" class="mt-2 text-gray-700">Training mode ON</div>
+      </div>
+      <div class="w-full md:w-1/2">
+        <div class="bg-white rounded shadow p-4">
+          <h2 class="text-xl font-bold mb-2">Throw History</h2>
+          <div id="historyTableWrapper">
+            <table class="table-auto w-full text-sm text-left">
+              <thead>
+                <tr class="border-b">
+                  <th class="px-2 py-1">Round</th>
+                  <th class="px-2 py-1">Player</th>
+                  <th class="px-2 py-1">AI</th>
+                  <th class="px-2 py-1">Result</th>
+                </tr>
+              </thead>
+              <tbody id="historyTable"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="bg-white rounded shadow p-4 mt-4">
+          <h2 class="text-xl font-bold mb-2">Training Samples</h2>
+          <table class="table-auto w-full text-sm text-left">
+            <tbody>
+              <tr>
+                <td class="px-2 py-1">Rock</td>
+                <td id="countR" class="px-2 py-1">0</td>
+              </tr>
+              <tr>
+                <td class="px-2 py-1">Paper</td>
+                <td id="countP" class="px-2 py-1">0</td>
+              </tr>
+              <tr>
+                <td class="px-2 py-1">Scissors</td>
+                <td id="countS" class="px-2 py-1">0</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="bg-white rounded shadow p-4 mt-4">
+          <h2 class="text-xl font-bold mb-2">Transition Table</h2>
+          <table class="table-auto w-full text-sm text-left">
+            <thead>
+              <tr class="border-b">
+                <th></th>
+                <th>R</th>
+                <th>P</th>
+                <th>S</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>After R</td>
+                <td id="tRR"></td>
+                <td id="tRP"></td>
+                <td id="tRS"></td>
+              </tr>
+              <tr>
+                <td>After P</td>
+                <td id="tPR"></td>
+                <td id="tPP"></td>
+                <td id="tPS"></td>
+              </tr>
+              <tr>
+                <td>After S</td>
+                <td id="tSR"></td>
+                <td id="tSP"></td>
+                <td id="tSS"></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const video = document.getElementById("webcam");
+      const canvas = document.getElementById("overlay");
+      const ctx = canvas.getContext("2d");
+      const status = document.getElementById("status");
+      const historyTable = document.getElementById("historyTable");
+      const countR = document.getElementById("countR");
+      const countP = document.getElementById("countP");
+      const countS = document.getElementById("countS");
+      const toggleBtn = document.getElementById("toggleTraining");
+      const labelSelector = document.getElementById("labelSelector");
+      const triggerBtn = document.getElementById("trigger");
+      const gestureDisplay = document.getElementById("gestureDisplay");
+
+      const transitionIds = {
+        R: { R: "tRR", P: "tRP", S: "tRS" },
+        P: { R: "tPR", P: "tPP", S: "tPS" },
+        S: { R: "tSR", P: "tSP", S: "tSS" }
+      };
+
+      let model, classifier;
+      let collecting = true;
+      let collectLabel = "R";
+      let history = [];
+      let transitions = {
+        R: { R: 1, P: 1, S: 1 },
+        P: { R: 1, P: 1, S: 1 },
+        S: { R: 1, P: 1, S: 1 }
+      };
+      let trainingCounts = { R: 0, P: 0, S: 0 };
+      let lastGesture = "?";
+      let aiThrow = "R";
+      let isProcessing = false;
+      let lastCaptureTime = 0;
+      const CAPTURE_INTERVAL = 1000;
+
+      function updateTransitionTable() {
+        for (const prev in transitions) {
+          for (const next in transitions[prev]) {
+            const id = transitionIds[prev][next];
+            document.getElementById(id).textContent = transitions[prev][next];
+          }
+        }
+      }
+
+      async function setupCamera() {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: true
+        });
+        video.srcObject = stream;
+        return new Promise(
+          (resolve) => (video.onloadedmetadata = () => resolve(video))
+        );
+      }
+
+      function getLabelFromGesture(landmarks) {
+        return landmarks.map(([x, y]) => [x, y]).flat();
+      }
+
+      function predictNextMove() {
+        if (history.length < 2)
+          return ["R", "P", "S"][Math.floor(Math.random() * 3)];
+        const last = history[history.length - 1];
+        const stats = transitions[last];
+        const next = Object.keys(stats).reduce((a, b) =>
+          stats[a] > stats[b] ? a : b
+        );
+        const counter = { R: "P", P: "S", S: "R" };
+        return counter[next];
+      }
+
+      function updateTransitions(prev, current) {
+        if (transitions[prev] && transitions[prev][current] !== undefined) {
+          transitions[prev][current]++;
+        }
+        updateTransitionTable();
+      }
+
+      function updateTrainingCount(label) {
+        trainingCounts[label]++;
+        countR.innerText = trainingCounts.R;
+        countP.innerText = trainingCounts.P;
+        countS.innerText = trainingCounts.S;
+
+        const hasEnoughData = Object.values(trainingCounts).every(
+          (count) => count >= 5
+        );
+        if (hasEnoughData) {
+          triggerBtn.classList.remove("hidden");
+          if (!collecting) status.innerText = "Ready to play!";
+        }
+      }
+
+      async function captureGesture() {
+        const now = Date.now();
+        if (now - lastCaptureTime < CAPTURE_INTERVAL) return;
+        lastCaptureTime = now;
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        gestureDisplay.innerText = "";
+
+        const predictions = await model.estimateHands(video);
+        if (predictions.length === 0) return;
+
+        const keypoints = predictions[0].landmarks;
+        ctx.fillStyle = "rgba(255,0,0,0.6)";
+        keypoints.forEach(([x, y]) => {
+          ctx.beginPath();
+          ctx.arc(x, y, 5, 0, 2 * Math.PI);
+          ctx.fill();
+        });
+
+        const flat = tf.tensor(getLabelFromGesture(keypoints));
+        if (collecting) {
+          classifier.addExample(flat, collectLabel);
+          updateTrainingCount(collectLabel);
+        }
+
+        if (classifier.getNumClasses() > 0) {
+          const result = await classifier.predictClass(flat);
+          lastGesture = result.label;
+          gestureDisplay.innerText = `Detected: ${lastGesture}`;
+        }
+      }
+
+      async function playRound() {
+        if (isProcessing) return;
+        isProcessing = true;
+        await captureGesture();
+
+        if (!["R", "P", "S"].includes(lastGesture)) {
+          status.innerText = "Invalid gesture or not enough training.";
+          isProcessing = false;
+          return;
+        }
+
+        const player = lastGesture;
+        const winner =
+          player === aiThrow
+            ? "Draw"
+            : (player === "R" && aiThrow === "S") ||
+              (player === "P" && aiThrow === "R") ||
+              (player === "S" && aiThrow === "P")
+            ? "You Win"
+            : "AI Wins";
+
+        const round = history.length + 1;
+        const row = document.createElement("tr");
+        row.innerHTML = `<td class="px-2 py-1">${round}</td><td class="px-2 py-1">${player}</td><td class="px-2 py-1">${aiThrow}</td><td class="px-2 py-1">${winner}</td>`;
+        historyTable.appendChild(row);
+        historyTable.parentElement.scrollTop =
+          historyTable.parentElement.scrollHeight;
+
+        if (history.length > 0) {
+          updateTransitions(history[history.length - 1], player);
+        }
+
+        history.push(player);
+        aiThrow = predictNextMove();
+        status.innerText = `You: ${player} | AI: ${aiThrow} => ${winner}`;
+        isProcessing = false;
+      }
+
+      async function main() {
+        await setupCamera();
+        model = await handpose.load();
+        classifier = knnClassifier.create();
+        updateTransitionTable();
+
+        setInterval(() => {
+          if (!isProcessing) captureGesture();
+        }, 200);
+      }
+
+      toggleBtn.addEventListener("click", () => {
+        collecting = !collecting;
+        status.innerText = collecting ? "Training mode ON" : "Ready to play!";
+      });
+
+      labelSelector.addEventListener("change", (e) => {
+        collectLabel = e.target.value;
+      });
+
+      triggerBtn.addEventListener("click", playRound);
+
+      main();
+    </script>
+  </body>
+</html>
